@@ -6,12 +6,14 @@ from config import sql_server_url, postgres_url
 import time
 
 engine_src = create_engine(sql_server_url)
-# PostgreSQL optimizado para Neon
+
+# 1. MOTOR OPTIMIZADO PARA AWS Y BATCH INSERTS
 engine_dest = create_engine(
     postgres_url,
-    pool_size=5,  # Más conexiones activas para mejor concurrencia
-    max_overflow=5,  # Permite overflow para picos de carga
-    pool_pre_ping=True,  # Verifica conexión antes de usar
+    pool_size=5,
+    max_overflow=10, 
+    pool_pre_ping=True,
+    use_insertmanyvalues=True,  # <- CRÍTICO: Fuerza el batch insert real
     echo=False
 )
 
@@ -21,22 +23,21 @@ def sync_persons():
     
     query = """
     SELECT DISTINCT
-        RTRIM(dcIdTrabajador) as external_id,
-        dcNombres as first_name,
-        dcPaterno as father_last_name,
-        dcMaterno as mother_last_name,
+        RTRIM(dcIdTrabajador) as ext_id,
+        dcNombres as fn,
+        dcPaterno as lnp,
+        dcMaterno as lnm,
         email,
         telefonos as phone,
-        dcFecNaci as birth_date,
-        RTRIM(dnNroDoc) as document_number,
-        direccion as address,
+        dcFecNaci as bday,
+        RTRIM(dnNroDoc) as dnum,
+        direccion as addr,
         sexo as gender,
         estadocivil as civil_status
     FROM [dbo].[V_PERSONA_AGRUPAMIENTO_3]
     WHERE dnNroDoc IS NOT NULL AND RTRIM(dnNroDoc) <> '' AND fnCodEstado = 1
     """
     
-    # Query de UPSERT (igual que la tuya)
     upsert_query = text("""
         INSERT INTO public.persons (
             first_name, father_last_name, mother_last_name, 
@@ -60,79 +61,70 @@ def sync_persons():
     """)
 
     success_count = 0
-    chunk_size = 1000  # Aumentado a 1000 para Neon
+    # 2. AUMENTO DE CHUNK SIZE
+    chunk_size = 10000 
     max_retries = 3
-    retry_delay = 1  # Reducido a 1 segundo
+    retry_delay = 1
 
     try:
         print("[DB] Conectando a bases de datos...")
         with engine_dest.connect() as conn:
             print("[OK] Conexión establecida. Iniciando lectura de datos...")
-            # pd.read_sql con chunksize devuelve un generador
             chunk_number = 0
+            
             for chunk in pd.read_sql(query, engine_src, chunksize=chunk_size):
                 chunk_number += 1
                 print(f"\n[BATCH {chunk_number}] Procesando {len(chunk)} registros...")
                 
-                # --- 1. LIMPIEZA VECTORIZADA CON PANDAS ---
-                print(f"  [CLEAN] Iniciando limpieza de datos...")
+                print(f"  [CLEAN] Iniciando limpieza de datos en memoria...")
                 chunk = chunk.fillna('')
                 
-                # Fechas
-                chunk['birth_date'] = pd.to_datetime(chunk['birth_date'], errors='coerce')
-                chunk.loc[chunk['birth_date'] < '1900-01-02', 'birth_date'] = None
+                # 3. OPTIMIZACIÓN DE PANDAS: Mutación in-place (mucho más rápido)
+                # Limpieza de strings general
+                str_cols = ['fn', 'lnp', 'lnm', 'email', 'phone', 'dnum', 'addr', 'gender', 'civil_status', 'ext_id']
+                for col in str_cols:
+                    chunk[col] = chunk[col].astype(str).str.strip()
                 
-                # Limpieza de textos y recortes
-                ext_ids = chunk['external_id'].astype(str).str.strip()
+                # Truncados específicos
+                chunk['phone'] = chunk['phone'].str[:50]
+                chunk['addr'] = chunk['addr'].str[:255]
                 
-                # Emails: Crear máscara donde no hay '@'
-                emails = chunk['email'].astype(str).str.strip()
-                bad_emails = ~emails.str.contains('@', na=False)
-                emails.loc[bad_emails] = "user_" + ext_ids.loc[bad_emails] + "@sistema.local"
-                print(f"  [OK] Limpieza completada. Emails inválidos corregidos: {bad_emails.sum()}")
+                # Manejo de Emails
+                bad_emails = ~chunk['email'].str.contains('@', na=False)
+                chunk.loc[bad_emails, 'email'] = "user_" + chunk.loc[bad_emails, 'ext_id'] + "@sistema.local"
+                
+                # Manejo de Fechas
+                chunk['bday'] = pd.to_datetime(chunk['bday'], errors='coerce')
+                chunk.loc[chunk['bday'] < '1900-01-02', 'bday'] = None
+                chunk['bday'] = chunk['bday'].replace({pd.NaT: None}) # SQLAlchemy prefiere None sobre NaT
+                
+                # Campo constante
+                chunk['dtype'] = 'DNI'
 
-                # --- 2. PREPARACIÓN DE DICCIONARIO PARA BATCH UPSERT ---
-                print(f"  [PREP] Preparando parámetros para UPSERT...")
-                # Mapeamos las columnas exactamente a los nombres de tus parámetros SQL (:fn, :lnp, etc.)
-                params_df = pd.DataFrame({
-                    'fn': chunk['first_name'].astype(str).str.strip(),
-                    'lnp': chunk['father_last_name'].astype(str).str.strip(),
-                    'lnm': chunk['mother_last_name'].astype(str).str.strip(),
-                    'email': emails,
-                    'phone': chunk['phone'].astype(str).str.strip().str[:50],
-                    'bday': chunk['birth_date'].where(pd.notnull(chunk['birth_date']), None),
-                    'dtype': 'DNI',
-                    'dnum': chunk['document_number'].astype(str).str.strip(),
-                    'addr': chunk['address'].astype(str).str.strip().str[:255],
-                    'gender': chunk['gender'].astype(str).str.strip(),
-                    'civil_status': chunk['civil_status'].astype(str).str.strip(),
-                    'ext_id': ext_ids
-                })
-
-                # --- 3. EJECUCIÓN POR LOTES (BATCH EXECUTION) ---
-                print(f"  [EXEC] Iniciando UPSERT en PostgreSQL...")
-                # Pasarle una lista de diccionarios a SQLAlchemy dispara `executemany` automáticamente
-                records = params_df.to_dict('records')
+                # --- EJECUCIÓN POR LOTES ---
+                print(f"  [EXEC] Iniciando UPSERT masivo en PostgreSQL...")
+                
+                # Extraemos solo las columnas necesarias, el orden no importa para diccionarios
+                records = chunk[['fn', 'lnp', 'lnm', 'email', 'phone', 'bday', 'dtype', 'dnum', 'addr', 'gender', 'civil_status', 'ext_id']].to_dict('records')
                 
                 retry_count = 0
                 inserted = False
                 while retry_count < max_retries and not inserted:
                     try:
                         conn.execute(upsert_query, records)
-                        conn.commit() # Commit por cada bloque completado
+                        conn.commit()
                         success_count += len(records)
-                        print(f"[OK] Lote #{chunk_number}: {len(records)} registros sincronizado. Total acumulado: {success_count}")
+                        print(f"  [OK] Lote #{chunk_number} sincronizado exitosamente. Total: {success_count}")
                         inserted = True
                     except Exception as e:
                         retry_count += 1
                         error_msg = str(e)[:150]
                         if retry_count < max_retries:
-                            print(f"[WARN] Error en lote #{chunk_number} (intento {retry_count}/{max_retries}): {error_msg}")
-                            print(f"   [WAIT] Esperando {retry_delay} segundos antes de reintentar...")
+                            print(f"  [WARN] Error en lote #{chunk_number} (intento {retry_count}/{max_retries}): {error_msg}")
                             time.sleep(retry_delay)
                             conn.rollback()
                         else:
-                            print(f"[ERR] Lote #{chunk_number} falló después de {max_retries} intentos: {error_msg}")
+                            print(f"  [ERR] Lote #{chunk_number} falló tras {max_retries} intentos: {error_msg}")
                             conn.rollback()
                     
     except Exception as e:

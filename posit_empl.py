@@ -1,16 +1,23 @@
 import pandas as pd
-from sqlalchemy import create_engine, text
+import numpy as np
+from sqlalchemy import create_engine, text, Table, MetaData
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from datetime import datetime
 import uuid
 import bcrypt
+import time
 from config import sql_server_url, postgres_url
 
 engine_src = create_engine(sql_server_url)
-engine_dest = create_engine(postgres_url)
 
-def clean_text(text_val):
-    if not text_val: return ""
-    return " ".join(str(text_val).split())
+# 1. MOTOR OPTIMIZADO PARA AWS Y BATCH INSERTS MASIVOS
+engine_dest = create_engine(
+    postgres_url,
+    pool_size=5,
+    max_overflow=10,
+    use_insertmanyvalues=True,  # <- CRÍTICO: Fuerza el empaquetado binario de inserts
+    echo=False
+)
 
 def hash_password(password: str) -> str:
     """Hash a password using bcrypt"""
@@ -19,9 +26,10 @@ def hash_password(password: str) -> str:
     return hashed.decode('utf-8')
 
 def sync_active_only():
-    print("🚀 Sincronización Final: Solo Activos + Usuarios por DNI (Sin Correo)...")
-    print(f"[DB] Conectando a: {postgres_url.split('@')[1]}")
+    print("🚀 Sincronización Final: Solo Activos + Control de Cambios de Cargo (Alta Velocidad)...")
+    print(f"[DB] Conectando a destino en AWS...")
     
+    # 2. EXTRACCIÓN MÁS RÁPIDA DE SQL SERVER
     query = """
     SELECT 
         RTRIM(dcIdSGHH) as emp_ext_id,
@@ -36,23 +44,31 @@ def sync_active_only():
     df_active = pd.read_sql(query, engine_src)
     print(f"📥 Se extrajeron {len(df_active)} empleados activos de SQL Server")
     
-    # LIMPIAR DATA ANTES DE USAR
+    if df_active.empty:
+        print("⚠️ No hay empleados activos que procesar.")
+        return
+    
+    # 3. LIMPIEZA VECTORIZADA COMPLETA (Evita bucles pesados de Pandas)
+    df_active = df_active.fillna('')
     df_active['person_ext_id'] = df_active['person_ext_id'].astype(str).str.strip()
     df_active['company_ruc'] = df_active['company_ruc'].astype(str).str.strip()
     df_active['position_raw'] = df_active['position_raw'].astype(str).str.strip()
-    df_active['position_clean'] = df_active['position_raw'].apply(clean_text)
+    df_active['position_clean'] = df_active['position_raw'].str.replace(r'\s+', ' ', regex=True).str.strip()
 
-    # CONTEO ANTES
+    # 4. CONTEO AISLADO (Evita el error 'InvalidRequestError' de transacciones duplicadas)
     with engine_dest.connect() as temp_conn:
         usuarios_antes = temp_conn.execute(text("SELECT COUNT(*) FROM public.users")).scalar()
         print(f"📊 Usuarios ANTES: {usuarios_antes}")
     
-    # TRANSACCIÓN PRINCIPAL (nueva conexión)
+    # CONEXIÓN PRINCIPAL CON TRANSACCIÓN ÚNICA
     with engine_dest.connect() as conn:
         with conn.begin():
-            # 1. CARGOS - Bulk Insert
+            
+            # --- PASO 1: SINCRONIZAR CARGOS ---
             unique_positions = df_active['position_clean'].dropna().unique()
+            unique_positions = [p for p in unique_positions if p != '']
             print(f"🏢 Sincronizando {len(unique_positions)} cargos...")
+            
             pos_records = [{'n': p, 't': datetime.now()} for p in unique_positions]
             if pos_records:
                 conn.execute(text("""
@@ -61,90 +77,86 @@ def sync_active_only():
                     ON CONFLICT (name) DO UPDATE SET updated_at = EXCLUDED.updated_at
                 """), pos_records)
 
-            # 2. EMPLEADOS ACTIVOS - Pre-cargar referencias en memoria
-            print("📋 Pre-cargando referencias de Personas, Empresas y Cargos...")
-            
-            # Obtener todas las personas relevantes
-            person_ext_ids = df_active['person_ext_id'].unique().tolist()
-            person_placeholders = ','.join([f':p{i}' for i in range(len(person_ext_ids))])
-            person_params = {f'p{i}': pid for i, pid in enumerate(person_ext_ids)}
-            person_ids = conn.execute(text(f"""
-                SELECT external_id, id_person FROM public.persons 
-                WHERE external_id IN ({person_placeholders})
-            """), person_params).fetchall()
-            person_map = {p[0]: p[1] for p in person_ids}
-            
-            # Obtener todas las empresas relevantes
-            company_rucs = df_active['company_ruc'].unique().tolist()
-            company_placeholders = ','.join([f':c{i}' for i in range(len(company_rucs))])
-            company_params = {f'c{i}': ruc for i, ruc in enumerate(company_rucs)}
-            company_ids = conn.execute(text(f"""
-                SELECT ruc, id_company FROM public.companies 
-                WHERE ruc IN ({company_placeholders})
-            """), company_params).fetchall()
-            company_map = {c[0]: c[1] for c in company_ids}
-            
-            # Obtener todos los cargos relevantes
-            position_placeholders = ','.join([f':pos{i}' for i in range(len(unique_positions))])
-            position_params = {f'pos{i}': pos for i, pos in enumerate(unique_positions)}
-            position_ids = conn.execute(text(f"""
-                SELECT name, id_position FROM public.positions 
-                WHERE name IN ({position_placeholders})
-            """), position_params).fetchall()
-            position_map = {pos[0]: pos[1] for pos in position_ids}
-            
-            print(f"  ✅ Personas encontradas: {len(person_map)}")
-            print(f"  ✅ Empresas encontradas: {len(company_map)}")
-            print(f"  ✅ Cargos encontrados: {len(position_map)}")
+            # --- PASO 2: DESCARGAR MAPAS A MEMORIA (Evita queries IN gigantes que tumban la red) ---
+            print("📋 Pre-cargando tablas de referencia en diccionarios...")
+            person_map = dict(conn.execute(text("SELECT external_id, id_person FROM public.persons")).fetchall())
+            company_map = dict(conn.execute(text("SELECT ruc, id_company FROM public.companies")).fetchall())
+            position_map = dict(conn.execute(text("SELECT name, id_position FROM public.positions")).fetchall())
 
-            # 3. Preparar empleados para inserción en batch
-            print("👥 Preparando empleados para inserción en batch...")
-            employee_records = []
-            active_person_ids = []
-            skipped = 0
+            # --- PASO 3: RELACIONAR EN MEMORIA (Cruzado instantáneo con Pandas) ---
+            print("👥 Generando relaciones de llaves foráneas...")
+            df_active['pers_id'] = df_active['person_ext_id'].map(person_map)
+            df_active['comp_id'] = df_active['company_ruc'].map(company_map)
+            df_active['pos_id'] = df_active['position_clean'].map(position_map)
             
-            for _, row in df_active.iterrows():
-                person_id = person_map.get(row['person_ext_id'])
-                company_id = company_map.get(row['company_ruc'])
-                position_id = position_map.get(row['position_clean'])
-                
-                if person_id and company_id and position_id:
-                    active_person_ids.append(person_id)
-                    employee_records.append({
-                        'start': row['start_date'],
-                        'pos_id': position_id,
-                        'comp_id': company_id,
-                        'pers_id': person_id,
-                        'ext_id': row['emp_ext_id']
-                    })
-                else:
-                    skipped += 1
+            # Filtrar registros válidos
+            df_valid = df_active.dropna(subset=['pers_id', 'comp_id', 'pos_id']).copy()
+            skipped = len(df_active) - len(df_valid)
             
-            # 4. Insertar empleados por batch
+            # Variables fijas requeridas por la BD de destino
+            df_valid['status'] = '1'
+            df_valid['updated_at'] = datetime.now()
+
+            # Renombrar columnas para encajar con los nombres reales de la tabla destino
+            employee_records = df_valid[['start_date', 'status', 'pos_id', 'comp_id', 'pers_id', 'emp_ext_id', 'updated_at']].rename(
+                columns={
+                    'pos_id': 'position_id',
+                    'comp_id': 'company_id',
+                    'pers_id': 'person_id',
+                    'emp_ext_id': 'external_id'
+                }
+            ).to_dict('records')
+            
+            active_person_ids = df_valid['pers_id'].tolist()
+
+            # --- PASO 4: UPSERT DE EMPLEADOS (CON ACTUALIZACIÓN DE CARGO) ---
             if employee_records:
-                print(f"📤 Insertando {len(employee_records)} empleados (se saltaron {skipped})...")
+                print(f"📤 Insertando/Actualizando {len(employee_records)} empleados (se saltaron {skipped})...")
+                
+                metadata = MetaData()
+                employees_table = Table('employees', metadata, autoload_with=conn)
+                
+                # Sentencia nativa
+                stmt = pg_insert(employees_table)
+                
+                # NUEVA LÓGICA: Se añade position_id, company_id y start_date al bloque SET.
+                # Si el empleado cambia de puesto en SQL Server, Postgres lo actualizará de golpe aquí.
+                upsert_stmt = stmt.on_conflict_do_update(
+                    index_elements=['external_id'],
+                    set_={
+                        'status': '1',
+                        'position_id': stmt.excluded.position_id,  # <- ACTUALIZA CARGO SI CAMBIÓ
+                        'company_id': stmt.excluded.company_id,    # <- ACTUALIZA EMPRESA SI CAMBIÓ
+                        'start_date': stmt.excluded.start_date,    # <- ACTUALIZA FECHA INGRESO SI CAMBIÓ
+                        'updated_at': stmt.excluded.updated_at
+                    }
+                )
+                
+                # Ejecución masiva por lotes real sin compilar parámetros individuales
+                conn.execute(upsert_stmt, employee_records)
+                print("  ✅ Empleados sincronizados con éxito.")
+
+            # --- PASO 5: DESACTIVAR USUARIOS INACTIVOS (Optimizado con ANY) ---
+            print(f"📋 Revisando usuarios para desactivar...")
+            current_active_users = pd.read_sql("SELECT person_id FROM public.users WHERE status = True", conn)
+            current_active_set = set(current_active_users['person_id'])
+            target_active_set = set(active_person_ids)
+            
+            to_deactivate = list(current_active_set - target_active_set)
+            
+            if to_deactivate:
+                print(f"🔌 Desactivando {len(to_deactivate)} usuarios inactivos...")
                 batch_size = 1000
-                for i in range(0, len(employee_records), batch_size):
-                    batch = employee_records[i:i+batch_size]
+                for i in range(0, len(to_deactivate), batch_size):
+                    batch_pids = to_deactivate[i:i+batch_size]
                     conn.execute(text("""
-                        INSERT INTO public.employees (start_date, status, position_id, company_id, person_id, external_id, updated_at)
-                        VALUES (:start, '1', :pos_id, :comp_id, :pers_id, :ext_id, NOW())
-                        ON CONFLICT (external_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
-                    """), batch)
-                    print(f"  ✅ Lote {i//batch_size + 1}: {len(batch)} registros")
+                        UPDATE public.users 
+                        SET status = False, updated_at = NOW() 
+                        WHERE person_id = ANY(:pids)
+                    """), {"pids": batch_pids})
 
-            # 5. DESACTIVAR USUARIOS QUE YA NO ESTÁN ACTIVOS
-            if active_person_ids:
-                print(f"📋 Desactivando usuarios no activos. IDs activos: {len(active_person_ids)}")
-                placeholders = ','.join([f':id{i}' for i in range(len(active_person_ids))])
-                params = {f'id{i}': pid for i, pid in enumerate(active_person_ids)}
-                conn.execute(text(f"""
-                    UPDATE public.users SET status = False, updated_at = NOW()
-                    WHERE person_id NOT IN ({placeholders}) AND status = True
-                """), params)
-
-            # 6. CREAR/ACTUALIZAR USUARIOS - Batch Insert
-            print("\n🔐 Paso 6: Creando/Actualizando usuarios por batch...")
+            # --- PASO 6: CREAR / REACTIVAR USUARIOS (Evita el cuello de botella de bcrypt) ---
+            print("\n🔐 Procesando creación y reactivación de credenciales...")
             nuevos = conn.execute(text("""
                 SELECT DISTINCT p.id_person, p.document_number
                 FROM public.persons p
@@ -152,44 +164,46 @@ def sync_active_only():
                 WHERE e.status = '1'
             """)).fetchall()
             
-            print(f"📊 Se encontraron {len(nuevos)} usuarios a procesar")
-            
-            if nuevos:
-                user_records = []
-                for n in nuevos:
-                    person_id = n[0]
-                    document_number = n[1]
-                    hashed_pass = hash_password(document_number)
-                    user_records.append({
+            existing_users = pd.read_sql("SELECT person_id FROM public.users", conn)
+            existing_users_set = set(existing_users['person_id'])
+
+            users_to_insert = []
+            users_to_reactivate = []
+
+            for n in nuevos:
+                person_id, document_number = n[0], n[1]
+                if person_id not in existing_users_set:
+                    # SOLO HASHEAMOS SI NO EXISTE EL USUARIO
+                    users_to_insert.append({
                         'id': str(uuid.uuid4()),
                         'user': document_number,
-                        'pass': hashed_pass,
+                        'pass': hash_password(document_number),
                         'pid': person_id
                     })
-                
-                # Insertar usuarios por batch
+                else:
+                    if person_id in target_active_set:
+                        users_to_reactivate.append({'pid': person_id})
+
+            if users_to_insert:
+                print(f"✨ Creando {len(users_to_insert)} usuarios NUEVOS en la plataforma...")
+                conn.execute(text("""
+                    INSERT INTO public.users (id_user, username, password, person_id, status, role, updated_at)
+                    VALUES (:id, :user, :pass, :pid, True, 'USER', NOW())
+                """), users_to_insert)
+            
+            if users_to_reactivate:
+                print(f"♻️ Reactivando {len(users_to_reactivate)} usuarios existentes de golpe con ANY()...")
+                pids_to_reactivate = [u['pid'] for u in users_to_reactivate]
                 batch_size = 1000
-                usuarios_insertados = 0
-                for i in range(0, len(user_records), batch_size):
-                    batch = user_records[i:i+batch_size]
-                    try:
-                        conn.execute(text("""
-                            INSERT INTO public.users (id_user, username, password, person_id, status, role, updated_at)
-                            VALUES (:id, :user, :pass, :pid, True, 'USER', NOW())
-                            ON CONFLICT (person_id) DO UPDATE SET
-                                username = EXCLUDED.username,
-                                password = EXCLUDED.password,
-                                status = True,
-                                updated_at = EXCLUDED.updated_at
-                        """), batch)
-                        usuarios_insertados += len(batch)
-                        print(f"  ✅ Lote {i//batch_size + 1}: {len(batch)} usuarios")
-                    except Exception as e:
-                        error_msg = str(e).split('\n')[0]
-                        print(f"⚠️ Error en lote {i//batch_size + 1}: {error_msg}")
-        
-        # El commit ocurre automáticamente al salir del with conn.begin()
-        print(f"\n✅ COMMIT realizado.")
+                for i in range(0, len(pids_to_reactivate), batch_size):
+                    batch_pids = pids_to_reactivate[i:i+batch_size]
+                    conn.execute(text("""
+                        UPDATE public.users 
+                        SET status = True, updated_at = NOW() 
+                        WHERE person_id = ANY(:pids)
+                    """), {"pids": batch_pids})
+
+        print(f"\n✅ COMMIT transaccional realizado con éxito.")
     
     # CONTEO DESPUÉS
     with engine_dest.connect() as temp_conn:
@@ -197,7 +211,7 @@ def sync_active_only():
         print(f"📊 Usuarios DESPUÉS: {usuarios_despues}")
         print(f"📈 Diferencia: +{usuarios_despues - usuarios_antes}")
 
-    print(f"\n✨ ¡Sincronización completada!")
+    print(f"\n✨ ¡Sincronización masiva de alto rendimiento completada!")
 
 if __name__ == "__main__":
     sync_active_only()
