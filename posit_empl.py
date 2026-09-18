@@ -29,12 +29,13 @@ def hash_password(password: str) -> str:
 
 
 def build_user_record(user_data):
-    person_id, document_number = user_data
+    person_id, document_number, email = user_data
     return {
         'id': str(uuid.uuid4()),
         'user': document_number,
         'pass': hash_password(document_number),
-        'pid': person_id
+        'pid': person_id,
+        'email': email
     }
 
 def sync_active_only():
@@ -49,9 +50,14 @@ def sync_active_only():
         RTRIM(dcRucEmpresa) as company_ruc,
         dcDesCargo as position_raw,
         ddFechaIngreso as start_date,
-        fnCodEstado as status
-    FROM [dbo].[V_PERSONA_AGRUPAMIENTO_3]
-    WHERE fnCodEstado = 1
+        fnCodEstado as status,
+        u.email as user_email
+    FROM [dbo].[V_PERSONA_AGRUPAMIENTO_3] v
+    LEFT JOIN [RUNAPROD_V2].[RunaUser].[Persona] p
+        ON LTRIM(RTRIM(v.dcIdTrabajador)) = LTRIM(RTRIM(p.codSghh))
+    LEFT JOIN [RUNAPROD_V2].[RunaUser].[Usuario] u
+        ON u.persona_id = p.id_persona
+    WHERE v.fnCodEstado = 1
     """
     df_active = pd.read_sql(query, engine_src)
     print(f"📥 Se extrajeron {len(df_active)} empleados activos de SQL Server")
@@ -65,6 +71,7 @@ def sync_active_only():
     df_active['person_ext_id'] = df_active['person_ext_id'].astype(str).str.strip()
     df_active['company_ruc'] = df_active['company_ruc'].astype(str).str.strip()
     df_active['position_raw'] = df_active['position_raw'].astype(str).str.strip()
+    df_active['user_email'] = df_active['user_email'].astype(str).str.strip()
     df_active['position_clean'] = df_active['position_raw'].str.replace(r'\s+', ' ', regex=True).str.strip()
 
     # 4. CONTEO AISLADO (Evita el error 'InvalidRequestError' de transacciones duplicadas)
@@ -100,6 +107,20 @@ def sync_active_only():
             df_active['pers_id'] = df_active['person_ext_id'].map(person_map)
             df_active['comp_id'] = df_active['company_ruc'].map(company_map)
             df_active['pos_id'] = df_active['position_clean'].map(position_map)
+
+            # El email se sincroniza para toda persona encontrada, aunque el
+            # empleado no tenga empresa o cargo válido para el upsert.
+            valid_email_mask = df_active['user_email'].str.match(
+                r'^[^@\s]+@[^@\s]+\.[^@\s]+$', na=False
+            ) & df_active['pers_id'].notna()
+            email_by_person = (
+                df_active.loc[valid_email_mask, ['pers_id', 'user_email']]
+                .drop_duplicates('user_email')
+                .set_index('pers_id')['user_email']
+                .to_dict()
+            )
+            if len(email_by_person) < valid_email_mask.sum():
+                print("⚠️ Emails repetidos detectados; solo se asignará cada email a una cuenta.")
             
             # Filtrar registros válidos
             df_valid = df_active.dropna(subset=['pers_id', 'comp_id', 'pos_id']).copy()
@@ -180,16 +201,64 @@ def sync_active_only():
             # varios hashes pueden ejecutarse en paralelo en los vCPU de AWS.
             users_to_insert = []
             if nuevos:
+                existing_email_rows = conn.execute(text("""
+                    SELECT email, person_id
+                    FROM public.users
+                    WHERE email = ANY(:emails)
+                """), {'emails': list(email_by_person.values())}).fetchall() if email_by_person else []
+                emails_used_by_other = {
+                    email for email, person_id in existing_email_rows
+                    if email_by_person.get(person_id) != email
+                }
+                insert_email_by_person = {
+                    person_id: email
+                    for person_id, email in email_by_person.items()
+                    if email not in emails_used_by_other
+                }
                 max_workers = min(8, os.cpu_count() or 1)
+                new_user_data = [
+                    (
+                        person_id,
+                        document_number,
+                        insert_email_by_person.get(person_id)
+                    )
+                    for person_id, document_number, email in nuevos
+                ]
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    users_to_insert = list(executor.map(build_user_record, nuevos))
+                    users_to_insert = list(executor.map(build_user_record, new_user_data))
 
             if users_to_insert:
                 print(f"✨ Creando {len(users_to_insert)} usuarios NUEVOS en la plataforma...")
                 conn.execute(text("""
-                    INSERT INTO public.users (id_user, username, password, person_id, status, role, updated_at)
-                    VALUES (:id, :user, :pass, :pid, True, 'USER', NOW())
+                    INSERT INTO public.users (
+                        id_user, username, password, email, person_id,
+                        status, role, updated_at
+                    )
+                    VALUES (:id, :user, :pass, :email, :pid, True, 'USER', NOW())
                 """), users_to_insert)
+
+            # Actualiza usuarios existentes con el email real del origen.
+            if email_by_person:
+                email_update = conn.execute(text("""
+                    UPDATE public.users u
+                    SET email = source.email, updated_at = NOW()
+                    FROM unnest(
+                        CAST(:pids AS integer[]),
+                        CAST(:emails AS text[])
+                    ) AS source(person_id, email)
+                    WHERE u.person_id = source.person_id
+                                            AND NOT EXISTS (
+                                                    SELECT 1
+                                                    FROM public.users other
+                                                    WHERE other.email = source.email
+                                                        AND other.person_id <> source.person_id
+                                            )
+                """), {
+                      'pids': [int(person_id) for person_id in email_by_person],
+                      'emails': list(email_by_person.values())
+                })
+                print(f"✉️ Emails actualizados: {email_update.rowcount}; "
+                      f"emails válidos en origen: {len(email_by_person)}")
             
             if active_person_ids:
                 reactivated = conn.execute(text("""
