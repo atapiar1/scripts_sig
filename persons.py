@@ -1,8 +1,9 @@
 import pandas as pd
-import numpy as np
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 from config import sql_server_url, postgres_url
+import os
 import time
 
 engine_src = create_engine(sql_server_url)
@@ -16,6 +17,10 @@ engine_dest = create_engine(
     use_insertmanyvalues=True,  # <- CRÍTICO: Fuerza el batch insert real
     echo=False
 )
+
+
+def is_unique_violation(error):
+    return getattr(error.orig, 'pgcode', None) == '23505'
 
 def sync_persons():
     print("[START] Iniciando sincronización de personas con procesamiento por lotes...")
@@ -62,7 +67,7 @@ def sync_persons():
 
     success_count = 0
     # 2. AUMENTO DE CHUNK SIZE
-    chunk_size = 10000 
+    chunk_size = int(os.getenv('PERSONS_CHUNK_SIZE', '25000'))
     max_retries = 3
     retry_delay = 1
 
@@ -117,15 +122,38 @@ def sync_persons():
                         print(f"  [OK] Lote #{chunk_number} sincronizado exitosamente. Total: {success_count}")
                         inserted = True
                     except Exception as e:
-                        retry_count += 1
-                        error_msg = str(e)[:150]
-                        if retry_count < max_retries:
-                            print(f"  [WARN] Error en lote #{chunk_number} (intento {retry_count}/{max_retries}): {error_msg}")
-                            time.sleep(retry_delay)
+                        if isinstance(e, IntegrityError) and is_unique_violation(e):
                             conn.rollback()
+                            inserted_count = 0
+                            skipped_count = 0
+
+                            for record in records:
+                                try:
+                                    with conn.begin_nested():
+                                        conn.execute(upsert_query, record)
+                                    inserted_count += 1
+                                except IntegrityError as row_error:
+                                    if not is_unique_violation(row_error):
+                                        raise
+                                    skipped_count += 1
+
+                            conn.commit()
+                            success_count += inserted_count
+                            print(
+                                f"  [OK] Lote #{chunk_number} sincronizado con "
+                                f"{skipped_count} duplicado(s) omitido(s). Total: {success_count}"
+                            )
+                            inserted = True
                         else:
-                            print(f"  [ERR] Lote #{chunk_number} falló tras {max_retries} intentos: {error_msg}")
-                            conn.rollback()
+                            retry_count += 1
+                            error_msg = str(e)[:150]
+                            if retry_count < max_retries:
+                                print(f"  [WARN] Error en lote #{chunk_number} (intento {retry_count}/{max_retries}): {error_msg}")
+                                time.sleep(retry_delay)
+                                conn.rollback()
+                            else:
+                                print(f"  [ERR] Lote #{chunk_number} falló tras {max_retries} intentos: {error_msg}")
+                                conn.rollback()
                     
     except Exception as e:
         print(f"[ERR] Error crítico durante la sincronización: {e}")

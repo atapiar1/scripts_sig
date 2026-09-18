@@ -6,6 +6,8 @@ from datetime import datetime
 import uuid
 import bcrypt
 import time
+import os
+from concurrent.futures import ThreadPoolExecutor
 from config import sql_server_url, postgres_url
 
 engine_src = create_engine(sql_server_url)
@@ -24,6 +26,16 @@ def hash_password(password: str) -> str:
     salt = bcrypt.gensalt(rounds=10)
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
     return hashed.decode('utf-8')
+
+
+def build_user_record(user_data):
+    person_id, document_number = user_data
+    return {
+        'id': str(uuid.uuid4()),
+        'user': document_number,
+        'pass': hash_password(document_number),
+        'pid': person_id
+    }
 
 def sync_active_only():
     print("🚀 Sincronización Final: Solo Activos + Control de Cambios de Cargo (Alta Velocidad)...")
@@ -136,24 +148,23 @@ def sync_active_only():
                 conn.execute(upsert_stmt, employee_records)
                 print("  ✅ Empleados sincronizados con éxito.")
 
-            # --- PASO 5: DESACTIVAR USUARIOS INACTIVOS (Optimizado con ANY) ---
+            # --- PASO 5: DESACTIVAR USUARIOS INACTIVOS (una sola operación SQL) ---
             print(f"📋 Revisando usuarios para desactivar...")
-            current_active_users = pd.read_sql("SELECT person_id FROM public.users WHERE status = True", conn)
-            current_active_set = set(current_active_users['person_id'])
-            target_active_set = set(active_person_ids)
-            
-            to_deactivate = list(current_active_set - target_active_set)
-            
-            if to_deactivate:
-                print(f"🔌 Desactivando {len(to_deactivate)} usuarios inactivos...")
-                batch_size = 1000
-                for i in range(0, len(to_deactivate), batch_size):
-                    batch_pids = to_deactivate[i:i+batch_size]
-                    conn.execute(text("""
-                        UPDATE public.users 
-                        SET status = False, updated_at = NOW() 
-                        WHERE person_id = ANY(:pids)
-                    """), {"pids": batch_pids})
+            if active_person_ids:
+                deactivated = conn.execute(text("""
+                    UPDATE public.users
+                    SET status = False, updated_at = NOW()
+                    WHERE status = True
+                      AND NOT (person_id = ANY(:pids))
+                """), {"pids": active_person_ids})
+            else:
+                deactivated = conn.execute(text("""
+                    UPDATE public.users
+                    SET status = False, updated_at = NOW()
+                    WHERE status = True
+                """))
+            if deactivated.rowcount:
+                print(f"🔌 Desactivados {deactivated.rowcount} usuarios inactivos.")
 
             # --- PASO 6: CREAR / REACTIVAR USUARIOS (Evita el cuello de botella de bcrypt) ---
             print("\n🔐 Procesando creación y reactivación de credenciales...")
@@ -161,28 +172,17 @@ def sync_active_only():
                 SELECT DISTINCT p.id_person, p.document_number
                 FROM public.persons p
                 INNER JOIN public.employees e ON p.id_person = e.person_id
-                WHERE e.status = '1'
+                LEFT JOIN public.users u ON u.person_id = p.id_person
+                WHERE e.status = '1' AND u.person_id IS NULL
             """)).fetchall()
-            
-            existing_users = pd.read_sql("SELECT person_id FROM public.users", conn)
-            existing_users_set = set(existing_users['person_id'])
 
+            # SOLO HASHEAMOS USUARIOS NUEVOS. bcrypt libera el GIL, por lo que
+            # varios hashes pueden ejecutarse en paralelo en los vCPU de AWS.
             users_to_insert = []
-            users_to_reactivate = []
-
-            for n in nuevos:
-                person_id, document_number = n[0], n[1]
-                if person_id not in existing_users_set:
-                    # SOLO HASHEAMOS SI NO EXISTE EL USUARIO
-                    users_to_insert.append({
-                        'id': str(uuid.uuid4()),
-                        'user': document_number,
-                        'pass': hash_password(document_number),
-                        'pid': person_id
-                    })
-                else:
-                    if person_id in target_active_set:
-                        users_to_reactivate.append({'pid': person_id})
+            if nuevos:
+                max_workers = min(8, os.cpu_count() or 1)
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    users_to_insert = list(executor.map(build_user_record, nuevos))
 
             if users_to_insert:
                 print(f"✨ Creando {len(users_to_insert)} usuarios NUEVOS en la plataforma...")
@@ -191,17 +191,14 @@ def sync_active_only():
                     VALUES (:id, :user, :pass, :pid, True, 'USER', NOW())
                 """), users_to_insert)
             
-            if users_to_reactivate:
-                print(f"♻️ Reactivando {len(users_to_reactivate)} usuarios existentes de golpe con ANY()...")
-                pids_to_reactivate = [u['pid'] for u in users_to_reactivate]
-                batch_size = 1000
-                for i in range(0, len(pids_to_reactivate), batch_size):
-                    batch_pids = pids_to_reactivate[i:i+batch_size]
-                    conn.execute(text("""
-                        UPDATE public.users 
-                        SET status = True, updated_at = NOW() 
-                        WHERE person_id = ANY(:pids)
-                    """), {"pids": batch_pids})
+            if active_person_ids:
+                reactivated = conn.execute(text("""
+                    UPDATE public.users
+                    SET status = True, updated_at = NOW()
+                    WHERE status = False AND person_id = ANY(:pids)
+                """), {"pids": active_person_ids})
+                if reactivated.rowcount:
+                    print(f"♻️ Reactivados {reactivated.rowcount} usuarios existentes.")
 
         print(f"\n✅ COMMIT transaccional realizado con éxito.")
     
