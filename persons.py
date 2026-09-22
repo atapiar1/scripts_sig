@@ -12,10 +12,13 @@ engine_src = create_engine(sql_server_url)
 engine_dest = create_engine(
     postgres_url,
     pool_size=5,
-    max_overflow=10, 
+    max_overflow=10,
     pool_pre_ping=True,
-    use_insertmanyvalues=True,  # <- CRÍTICO: Fuerza el batch insert real
-    echo=False
+    use_insertmanyvalues=True,
+    echo=False,
+    connect_args={
+        "options": "-c statement_timeout=30000 -c lock_timeout=5000"
+    }
 )
 
 
@@ -66,8 +69,7 @@ def sync_persons():
     """)
 
     success_count = 0
-    # 2. AUMENTO DE CHUNK SIZE
-    chunk_size = int(os.getenv('PERSONS_CHUNK_SIZE', '25000'))
+    chunk_size = int(os.getenv('PERSONS_CHUNK_SIZE', '1000'))
     max_retries = 3
     retry_delay = 1
 
@@ -116,8 +118,8 @@ def sync_persons():
                 inserted = False
                 while retry_count < max_retries and not inserted:
                     try:
-                        conn.execute(upsert_query, records)
-                        conn.commit()
+                        with conn.begin():
+                            conn.execute(upsert_query, records)
                         success_count += len(records)
                         print(f"  [OK] Lote #{chunk_number} sincronizado exitosamente. Total: {success_count}")
                         inserted = True

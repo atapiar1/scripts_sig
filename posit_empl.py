@@ -10,16 +10,40 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from config import sql_server_url, postgres_url
 
-engine_src = create_engine(sql_server_url)
+engine_src = create_engine(sql_server_url, pool_timeout=30, connect_args={"timeout": 30})
 
 # 1. MOTOR OPTIMIZADO PARA AWS Y BATCH INSERTS MASIVOS
 engine_dest = create_engine(
     postgres_url,
     pool_size=5,
     max_overflow=10,
-    use_insertmanyvalues=True,  # <- CRÍTICO: Fuerza el empaquetado binario de inserts
-    echo=False
+    pool_timeout=30,
+    use_insertmanyvalues=True,
+    echo=False,
+    connect_args={
+        "connect_timeout": 10,
+        "options": "-c statement_timeout=30000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=30000"
+    }
 )
+
+
+def cleanup_stale_transactions():
+    """Termina transacciones abandonadas que puedan dejar bloqueos en Postgres."""
+    try:
+        with engine_dest.connect() as conn:
+            conn.execute(text("""
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND state = 'idle in transaction'
+                  AND xact_start IS NOT NULL
+                  AND now() - xact_start > INTERVAL '30 seconds'
+            """))
+            conn.commit()
+            print("[DB] Transacciones inactivas viejas terminadas.")
+    except Exception as exc:
+        print(f"[WARN] No se pudieron limpiar transacciones viejas: {exc}")
 
 def hash_password(password: str) -> str:
     """Hash a password using bcrypt"""
@@ -41,7 +65,8 @@ def build_user_record(user_data):
 def sync_active_only():
     print("🚀 Sincronización Final: Solo Activos + Control de Cambios de Cargo (Alta Velocidad)...")
     print(f"[DB] Conectando a destino en AWS...")
-    
+    cleanup_stale_transactions()
+
     # 2. EXTRACCIÓN MÁS RÁPIDA DE SQL SERVER
     query = """
     SELECT 
@@ -90,11 +115,15 @@ def sync_active_only():
             
             pos_records = [{'n': p, 't': datetime.now()} for p in unique_positions]
             if pos_records:
-                conn.execute(text("""
-                    INSERT INTO public.positions (name, description, updated_at) 
-                    VALUES (:n, :n, :t) 
-                    ON CONFLICT (name) DO UPDATE SET updated_at = EXCLUDED.updated_at
-                """), pos_records)
+                batch_size = int(os.getenv('POSITIONS_BATCH_SIZE', '100'))
+                for idx in range(0, len(pos_records), batch_size):
+                    batch = pos_records[idx:idx + batch_size]
+                    conn.execute(text("""
+                        INSERT INTO public.positions (name, description, updated_at)
+                        VALUES (:n, :n, :t)
+                        ON CONFLICT (name) DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    """), batch)
+                    print(f"    [positions batch {idx // batch_size + 1}] {len(batch)} cargos procesados")
 
             # --- PASO 2: DESCARGAR MAPAS A MEMORIA (Evita queries IN gigantes que tumban la red) ---
             print("📋 Pre-cargando tablas de referencia en diccionarios...")
@@ -145,28 +174,28 @@ def sync_active_only():
             # --- PASO 4: UPSERT DE EMPLEADOS (CON ACTUALIZACIÓN DE CARGO) ---
             if employee_records:
                 print(f"📤 Insertando/Actualizando {len(employee_records)} empleados (se saltaron {skipped})...")
-                
+
                 metadata = MetaData()
                 employees_table = Table('employees', metadata, autoload_with=conn)
-                
-                # Sentencia nativa
+
                 stmt = pg_insert(employees_table)
-                
-                # NUEVA LÓGICA: Se añade position_id, company_id y start_date al bloque SET.
-                # Si el empleado cambia de puesto en SQL Server, Postgres lo actualizará de golpe aquí.
                 upsert_stmt = stmt.on_conflict_do_update(
                     index_elements=['external_id'],
                     set_={
                         'status': '1',
-                        'position_id': stmt.excluded.position_id,  # <- ACTUALIZA CARGO SI CAMBIÓ
-                        'company_id': stmt.excluded.company_id,    # <- ACTUALIZA EMPRESA SI CAMBIÓ
-                        'start_date': stmt.excluded.start_date,    # <- ACTUALIZA FECHA INGRESO SI CAMBIÓ
+                        'position_id': stmt.excluded.position_id,
+                        'company_id': stmt.excluded.company_id,
+                        'start_date': stmt.excluded.start_date,
                         'updated_at': stmt.excluded.updated_at
                     }
                 )
-                
-                # Ejecución masiva por lotes real sin compilar parámetros individuales
-                conn.execute(upsert_stmt, employee_records)
+
+                # Reduce la presión del UPSERT masivo para evitar bloqueos por locks.
+                batch_size = int(os.getenv('EMPLOYEES_BATCH_SIZE', '500'))
+                for idx in range(0, len(employee_records), batch_size):
+                    batch = employee_records[idx:idx + batch_size]
+                    conn.execute(upsert_stmt, batch)
+                    print(f"    [batch {idx // batch_size + 1}] {len(batch)} empleados procesados")
                 print("  ✅ Empleados sincronizados con éxito.")
 
             # --- PASO 5: DESACTIVAR USUARIOS INACTIVOS (una sola operación SQL) ---
@@ -222,7 +251,7 @@ def sync_active_only():
                         document_number,
                         insert_email_by_person.get(person_id)
                     )
-                    for person_id, document_number, email in nuevos
+                    for person_id, document_number in nuevos
                 ]
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     users_to_insert = list(executor.map(build_user_record, new_user_data))
