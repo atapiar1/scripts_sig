@@ -46,7 +46,9 @@ def cleanup_stale_transactions():
         print(f"[WARN] No se pudieron limpiar transacciones viejas: {exc}")
 
 def hash_password(password: str) -> str:
-    """Hash a password using bcrypt"""
+    """Hash a password using bcrypt."""
+    if not password:
+        raise ValueError("Password no puede estar vacío.")
     salt = bcrypt.gensalt(rounds=10)
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
     return hashed.decode('utf-8')
@@ -93,11 +95,13 @@ def sync_active_only():
     
     # 3. LIMPIEZA VECTORIZADA COMPLETA (Evita bucles pesados de Pandas)
     df_active = df_active.fillna('')
+    df_active = df_active.drop_duplicates(subset=['emp_ext_id', 'person_ext_id', 'company_ruc', 'position_raw']).copy()
     df_active['person_ext_id'] = df_active['person_ext_id'].astype(str).str.strip()
     df_active['company_ruc'] = df_active['company_ruc'].astype(str).str.strip()
     df_active['position_raw'] = df_active['position_raw'].astype(str).str.strip()
     df_active['user_email'] = df_active['user_email'].astype(str).str.strip()
     df_active['position_clean'] = df_active['position_raw'].str.replace(r'\s+', ' ', regex=True).str.strip()
+    df_active = df_active[df_active['person_ext_id'] != '']
 
     # 4. CONTEO AISLADO (Evita el error 'InvalidRequestError' de transacciones duplicadas)
     with engine_dest.connect() as temp_conn:
@@ -142,14 +146,18 @@ def sync_active_only():
             valid_email_mask = df_active['user_email'].str.match(
                 r'^[^@\s]+@[^@\s]+\.[^@\s]+$', na=False
             ) & df_active['pers_id'].notna()
-            email_by_person = (
+            email_candidates = (
                 df_active.loc[valid_email_mask, ['pers_id', 'user_email']]
-                .drop_duplicates('user_email')
+                .drop_duplicates(subset=['pers_id'], keep='last')
+                .copy()
+            )
+            email_by_person = (
+                email_candidates
                 .set_index('pers_id')['user_email']
                 .to_dict()
             )
             if len(email_by_person) < valid_email_mask.sum():
-                print("⚠️ Emails repetidos detectados; solo se asignará cada email a una cuenta.")
+                print("⚠️ Emails repetidos detectados; se conservará un único email por persona.")
             
             # Filtrar registros válidos
             df_valid = df_active.dropna(subset=['pers_id', 'comp_id', 'pos_id']).copy()
@@ -169,7 +177,7 @@ def sync_active_only():
                 }
             ).to_dict('records')
             
-            active_person_ids = df_valid['pers_id'].tolist()
+            active_person_ids = list(dict.fromkeys(df_valid['pers_id'].tolist()))
 
             # --- PASO 4: UPSERT DE EMPLEADOS (CON ACTUALIZACIÓN DE CARGO) ---
             if employee_records:
