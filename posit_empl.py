@@ -78,12 +78,19 @@ def sync_active_only():
         dcDesCargo as position_raw,
         ddFechaIngreso as start_date,
         fnCodEstado as status,
-        u.email as user_email
+        u.email as user_email,
+        RTRIM(a.desAreaOrg) as department_name,
+        CAST(a.id_areaOrg AS varchar(50)) as source_department_id,
+        tsa.fechaMod as department_mod
     FROM [dbo].[V_PERSONA_AGRUPAMIENTO_3] v
     LEFT JOIN [RUNAPROD_V2].[RunaUser].[Persona] p
         ON LTRIM(RTRIM(v.dcIdTrabajador)) = LTRIM(RTRIM(p.codSghh))
     LEFT JOIN [RUNAPROD_V2].[RunaUser].[Usuario] u
         ON u.persona_id = p.id_persona
+    LEFT JOIN [RUNAPROD_V2].[RunaUser].[TrabajadorxSubAreaOrg] tsa
+        ON tsa.persona_id = p.id_persona
+    LEFT JOIN [RUNAPROD_V2].[RunaUser].[AreaOrg] a
+        ON a.id_areaOrg = tsa.subAreaOrg_id
     WHERE v.fnCodEstado = 1
     """
     df_active = pd.read_sql(query, engine_src)
@@ -95,11 +102,15 @@ def sync_active_only():
     
     # 3. LIMPIEZA VECTORIZADA COMPLETA (Evita bucles pesados de Pandas)
     df_active = df_active.fillna('')
-    df_active = df_active.drop_duplicates(subset=['emp_ext_id', 'person_ext_id', 'company_ruc', 'position_raw']).copy()
+    df_active['department_mod'] = pd.to_datetime(df_active['department_mod'], errors='coerce')
+    df_active = df_active.sort_values(['person_ext_id', 'department_mod'], ascending=[True, False], na_position='last')
+    df_active = df_active.drop_duplicates(subset=['person_ext_id'], keep='first').copy()
+    df_active = df_active.drop_duplicates(subset=['emp_ext_id', 'person_ext_id', 'company_ruc', 'position_raw', 'department_name']).copy()
     df_active['person_ext_id'] = df_active['person_ext_id'].astype(str).str.strip()
     df_active['company_ruc'] = df_active['company_ruc'].astype(str).str.strip()
     df_active['position_raw'] = df_active['position_raw'].astype(str).str.strip()
     df_active['user_email'] = df_active['user_email'].astype(str).str.strip()
+    df_active['department_name'] = df_active['department_name'].astype(str).str.strip()
     df_active['position_clean'] = df_active['position_raw'].str.replace(r'\s+', ' ', regex=True).str.strip()
     df_active = df_active[df_active['person_ext_id'] != '']
 
@@ -112,33 +123,101 @@ def sync_active_only():
     with engine_dest.connect() as conn:
         with conn.begin():
             
-            # --- PASO 1: SINCRONIZAR CARGOS ---
-            unique_positions = df_active['position_clean'].dropna().unique()
-            unique_positions = [p for p in unique_positions if p != '']
+            # --- PASO 1: SINCRONIZAR DEPARTAMENTOS Y CARGOS ---
+            print("📋 Pre-cargando tablas de referencia en diccionarios...")
+            person_map = dict(conn.execute(text("SELECT external_id, id_person FROM public.persons")).fetchall())
+            company_map = dict(conn.execute(text("SELECT ruc, id_company FROM public.companies")).fetchall())
+
+            department_candidates = (
+                df_active.loc[df_active['department_name'] != '', ['department_name']]
+                .drop_duplicates()
+                .copy()
+            )
+            department_candidates['department_name'] = department_candidates['department_name'].astype(str).str.strip()
+            department_candidates = department_candidates[department_candidates['department_name'] != '']
+            print(f"📊 Departamentos detectados en origen: {len(department_candidates)}")
+            print(department_candidates['department_name'].head(20).to_list())
+
+            department_rows = []
+            seen_departments = set()
+            for _, row in department_candidates.iterrows():
+                department_name = row['department_name'].strip()
+                if not department_name:
+                    continue
+                if department_name in seen_departments:
+                    continue
+                seen_departments.add(department_name)
+                department_rows.append({
+                    'company_id': 1,
+                    'name': department_name
+                })
+
+            if department_rows:
+                print(f"🏢 Sincronizando {len(department_rows)} departamentos desde AreaOrg para company_id=1...")
+                for dept in department_rows:
+                    existing = conn.execute(text("""
+                        SELECT id_department
+                        FROM public.departments
+                        WHERE company_id = :company_id AND name = :name
+                        LIMIT 1
+                    """), dept).fetchone()
+                    if existing is None:
+                        conn.execute(text("""
+                            INSERT INTO public.departments (name, company_id, updated_at)
+                            VALUES (:name, :company_id, NOW())
+                        """), dept)
+
+            department_pairs = conn.execute(text("SELECT company_id, name, id_department FROM public.departments WHERE company_id = 1")).fetchall()
+            department_map = {
+                name: id_department
+                for company_id, name, id_department in department_pairs
+            }
+
+            df_active['pers_id'] = df_active['person_ext_id'].map(person_map)
+            df_active['comp_id'] = df_active['company_ruc'].map(company_map)
+            df_active['department_id'] = df_active.apply(
+                lambda row: department_map.get(row['department_name']) if row['department_name'] else None,
+                axis=1
+            )
+            df_active['department_id'] = df_active['department_id'].where(pd.notna(df_active['department_id']), None)
+
+            unique_positions = (
+                df_active.loc[df_active['position_clean'] != '', ['position_clean', 'department_id']]
+                .drop_duplicates()
+                .to_dict('records')
+            )
             print(f"🏢 Sincronizando {len(unique_positions)} cargos...")
-            
-            pos_records = [{'n': p, 't': datetime.now()} for p in unique_positions]
+
+            def normalize_department_value(value):
+                if pd.isna(value):
+                    return None
+                return int(value)
+
+            pos_records = [
+                {
+                    'n': p['position_clean'],
+                    'd': normalize_department_value(p['department_id']),
+                    't': datetime.now()
+                }
+                for p in unique_positions
+            ]
             if pos_records:
                 batch_size = int(os.getenv('POSITIONS_BATCH_SIZE', '100'))
                 for idx in range(0, len(pos_records), batch_size):
                     batch = pos_records[idx:idx + batch_size]
                     conn.execute(text("""
-                        INSERT INTO public.positions (name, description, updated_at)
-                        VALUES (:n, :n, :t)
-                        ON CONFLICT (name) DO UPDATE SET updated_at = EXCLUDED.updated_at
+                        INSERT INTO public.positions (name, description, department_id, updated_at)
+                        VALUES (:n, :n, :d, :t)
+                        ON CONFLICT (name) DO UPDATE SET
+                            department_id = EXCLUDED.department_id,
+                            updated_at = EXCLUDED.updated_at
                     """), batch)
                     print(f"    [positions batch {idx // batch_size + 1}] {len(batch)} cargos procesados")
 
-            # --- PASO 2: DESCARGAR MAPAS A MEMORIA (Evita queries IN gigantes que tumban la red) ---
-            print("📋 Pre-cargando tablas de referencia en diccionarios...")
-            person_map = dict(conn.execute(text("SELECT external_id, id_person FROM public.persons")).fetchall())
-            company_map = dict(conn.execute(text("SELECT ruc, id_company FROM public.companies")).fetchall())
             position_map = dict(conn.execute(text("SELECT name, id_position FROM public.positions")).fetchall())
 
-            # --- PASO 3: RELACIONAR EN MEMORIA (Cruzado instantáneo con Pandas) ---
+            # --- PASO 2: RELACIONAR EN MEMORIA (Cruzado instantáneo con Pandas) ---
             print("👥 Generando relaciones de llaves foráneas...")
-            df_active['pers_id'] = df_active['person_ext_id'].map(person_map)
-            df_active['comp_id'] = df_active['company_ruc'].map(company_map)
             df_active['pos_id'] = df_active['position_clean'].map(position_map)
 
             # El email se sincroniza para toda persona encontrada, aunque el
